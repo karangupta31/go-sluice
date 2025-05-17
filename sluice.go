@@ -106,9 +106,7 @@ func (b *Batcher[T, Q]) runCollector() {
 		case <-b.stopChan: // Signal to stop the batcher.
 			// Process any remaining items in the current batch.
 			if len(currentBatchItems) > 0 {
-				batchToDispatch := make([]BatchItem[T, Q], len(currentBatchItems))
-				copy(batchToDispatch, currentBatchItems)
-				b.dispatchBatchProcessing(batchToDispatch) // Dispatch as a non-blocking call.
+				b.dispatchBatchProcessing(currentBatchItems) // Dispatch as a non-blocking call.
 				currentBatchItems = nil
 			}
 			// Wait for all active workers to finish by trying to fill the workerPool.
@@ -121,10 +119,8 @@ func (b *Batcher[T, Q]) runCollector() {
 
 		case <-ticker.C: // batchInterval has elapsed.
 			if len(currentBatchItems) > 0 {
-				batchToDispatch := make([]BatchItem[T, Q], len(currentBatchItems))
-				copy(batchToDispatch, currentBatchItems)
-				go b.dispatchBatchProcessing(batchToDispatch) // Dispatch in a new goroutine.
-				currentBatchItems = nil                       // Reset for the next batch.
+				b.dispatchBatchProcessing(currentBatchItems) // Dispatch as a non-blocking call.
+				currentBatchItems = nil                      // Reset for the next batch.
 			}
 
 		case item, ok := <-b.itemChannel: // A new item has been submitted.
@@ -134,10 +130,8 @@ func (b *Batcher[T, Q]) runCollector() {
 			}
 			currentBatchItems = append(currentBatchItems, item)
 			if len(currentBatchItems) >= b.maxBatchSize { // Batch is full.
-				batchToDispatch := make([]BatchItem[T, Q], len(currentBatchItems))
-				copy(batchToDispatch, currentBatchItems)
-				go b.dispatchBatchProcessing(batchToDispatch) // Dispatch in a new goroutine.
-				currentBatchItems = nil                       // Reset for the next batch.
+				b.dispatchBatchProcessing(currentBatchItems) // Dispatch as a non-blocking call.
+				currentBatchItems = nil                      // Reset for the next batch.
 			}
 		}
 	}
