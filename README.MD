@@ -13,6 +13,8 @@ The `sluice.Batcher` is the core component, designed for ease of use and efficie
 *   **Configurable Batching:** Triggers batch processing based on:
     *   Maximum batch size.
     *   Time interval (batch window).
+*   **Smart Sharding:** Group items by custom keys (e.g., experiment ID, user type) to control which items are batched together.
+*   **Memory Efficient:** Automatic cleanup of inactive batch keys to prevent memory leaks when using many different keys over time.
 *   **ID Correlation:** Submitted items are given an ID, used by the `BatchFunc` to map results back, ensuring you get the correct output for your input.
 *   **Synchronous Submission:** The `SubmitAndAwait` method provides a simple way to submit an item and block until its specific result is available.
 *   **Graceful Shutdown:** The `Stop()` method ensures that any enqueued items are processed before the batcher shuts down its worker goroutines.
@@ -112,3 +114,101 @@ func main() {
 	time.Sleep(200 * time.Millisecond)
 }
 ```
+
+## Advanced: Sharding/Grouping
+
+You can control how items are grouped into batches using a `KeyFunc`. This is useful when you want to group requests by certain criteria (e.g., experiment ID, user type, etc.) for more efficient processing.
+
+```go
+package main
+
+import (
+	"fmt"
+	"github.com/karangupta31/go-sluice"
+)
+
+type Request struct {
+	ExperimentID string
+	UserID       string
+}
+
+type Response struct {
+	ExperimentID string
+	UserID       string  
+	Variant      string
+}
+
+func main() {
+	// BatchFunc that processes requests for the same experiment together
+	batchFunc := func(requests []Request, args ...interface{}) (map[string]Response, error) {
+		// This will receive requests grouped by experiment ID
+		fmt.Printf("Processing %d requests for experiment: %s\n", 
+			len(requests), requests[0].ExperimentID)
+		
+		results := make(map[string]Response)
+		for i, req := range requests {
+			id := fmt.Sprintf("%s-%s", req.ExperimentID, req.UserID)
+			results[id] = Response{
+				ExperimentID: req.ExperimentID,
+				UserID:       req.UserID,
+				Variant:      fmt.Sprintf("variant_%d", i+1),
+			}
+		}
+		return results, nil
+	}
+
+	// KeyFunc groups requests by experiment ID
+	keyFunc := func(req Request) string {
+		return req.ExperimentID // All requests with same experiment ID will be batched together
+	}
+
+	config := sluice.BatchProcessorConfig[Request, Response]{
+		Func:    batchFunc,
+		KeyFunc: keyFunc, // Enable sharding
+	}
+
+	batcher := sluice.NewBatcher(config, 100*time.Millisecond, 10, 2)
+	defer batcher.Stop()
+
+	// These requests will be automatically grouped by experiment ID
+	requests := []Request{
+		{"exp_123", "user_1"}, // ┐
+		{"exp_123", "user_2"}, // ├─ Batched together
+		{"exp_123", "user_3"}, // ┘
+		{"exp_456", "user_4"}, // ┐
+		{"exp_456", "user_5"}, // ┘ Batched together
+	}
+
+	for _, req := range requests {
+		id := fmt.Sprintf("%s-%s", req.ExperimentID, req.UserID)
+		response, err := batcher.SubmitAndAwait(id, req)
+		// Handle response...
+	}
+}
+```
+
+## Memory Management
+
+The batcher uses a unified map-based approach for both sharded and non-sharded batching:
+
+- **Unified Architecture**: Both sharded (multi-key) and non-sharded (single-key) modes use the same internal map structure, with non-sharded mode simply using a default key
+- **Conditional Cleanup**: Memory management and cleanup logic is only enabled when sharding is used (when `KeyFunc` is provided)
+- **Lock-Free Cleanup**: When enabled, a separate background goroutine coordinates with the main collector via channels to avoid blocking batch processing
+- **LRU Strategy**: Keys that haven't been used recently are eligible for removal
+- **Configurable Thresholds**: 
+  - Cleanup only triggers when there are 1000+ keys 
+  - Keys must be inactive for 10+ minutes before removal
+  - Cleanup runs every 5 minutes
+- **Non-Blocking**: Cleanup requests are sent via buffered channels and won't block if cleanup is already in progress
+- **Only Empty Batches**: Only removes keys for batches that are currently empty (no pending items)
+
+This design ensures optimal performance: non-sharded mode has no cleanup overhead, while sharded mode gets automatic memory management to prevent leaks when using many different keys over time.
+
+## Examples
+
+- [Basic Usage](examples/simple/main.go) - Simple user data fetching
+- [Sharding Example](examples/sharding/main.go) - Advanced grouping by experiment ID
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

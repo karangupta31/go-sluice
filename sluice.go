@@ -12,6 +12,9 @@ import (
 // It also returns an error if the entire batch processing encountered a critical failure.
 type BatchFunc[T any, Q any] func(inputs []T, commonArgs ...interface{}) (map[string]Q, error)
 
+// BatchKeyFunc defines a function that returns a key for sharding/grouping items.
+type BatchKeyFunc[T any] func(item T) string
+
 // BatchProcessorConfig holds the user-defined BatchFunc and any common arguments
 // that should be passed to every invocation of the BatchFunc.
 type BatchProcessorConfig[T any, Q any] struct {
@@ -20,6 +23,26 @@ type BatchProcessorConfig[T any, Q any] struct {
 	// CommonArgs are arguments that will be passed to every call of the BatchFunc.
 	// This is useful for passing dependencies like database connections or configurations.
 	CommonArgs []interface{}
+	// KeyFunc is an optional function to determine the batch/shard key for each item.
+	// If nil, all items are batched together.
+	KeyFunc BatchKeyFunc[T]
+
+	// CleanupConfig holds optional configuration for batch key cleanup when sharding is enabled.
+	// If nil, default cleanup parameters will be used.
+	CleanupConfig *CleanupConfig
+}
+
+// CleanupConfig holds configuration parameters for batch key cleanup.
+type CleanupConfig struct {
+	// MaxKeysBeforeCleanup is the threshold for triggering LRU cleanup.
+	// Default: 1000
+	MaxKeysBeforeCleanup int
+	// KeyInactiveThreshold is how long a key must be unused before it's eligible for cleanup.
+	// Default: 10 minutes
+	KeyInactiveThreshold time.Duration
+	// CleanupInterval is how often to check for inactive keys.
+	// Default: 5 minutes
+	CleanupInterval time.Duration
 }
 
 // BatchItem represents a single input item submitted to the Batcher.
@@ -58,6 +81,10 @@ type Batcher[T any, Q any] struct {
 	// stopped is a flag that indicates whether the Stop() method has been called,
 	// preventing new submissions.
 	stopped bool
+
+	// batchManager handles batches for both sharded and non-sharded modes.
+	// Cleanup logic is only enabled when sharding is used (KeyFunc != nil).
+	batchManager *BatchManager[T, Q]
 }
 
 // NewBatcher creates and initializes a new Batcher instance.
@@ -88,6 +115,11 @@ func NewBatcher[T any, Q any](config BatchProcessorConfig[T, Q], batchInterval t
 		workerPool:    make(chan struct{}, numWorkers), // Semaphore for worker concurrency.
 		stopChan:      make(chan struct{}),             // Signal channel for stopping.
 	}
+
+	// Always initialize batch manager, with cleanup enabled only if KeyFunc is provided
+	cleanupEnabled := config.KeyFunc != nil
+	b.batchManager = NewBatchManager[T, Q](cleanupEnabled, config.CleanupConfig)
+
 	go b.runCollector() // Start the main batch collection loop.
 	return b
 }
@@ -99,39 +131,54 @@ func (b *Batcher[T, Q]) runCollector() {
 	ticker := time.NewTicker(b.batchInterval)
 	defer ticker.Stop()
 
-	var currentBatchItems []BatchItem[T, Q]
-
 	for {
 		select {
 		case <-b.stopChan: // Signal to stop the batcher.
-			// Process any remaining items in the current batch.
-			if len(currentBatchItems) > 0 {
-				b.dispatchBatchProcessing(currentBatchItems) // Dispatch as a non-blocking call.
-				currentBatchItems = nil
+			// Process any remaining items in all batches.
+			allBatches := b.batchManager.FlushAllBatches()
+			for _, batch := range allBatches {
+				if len(batch) > 0 {
+					b.dispatchBatchProcessing(batch)
+				}
 			}
+			b.batchManager.Stop()
+
 			// Wait for all active workers to finish by trying to fill the workerPool.
-			// This ensures that all dispatched batches are processed before exiting.
 			for i := 0; i < cap(b.workerPool); i++ {
 				b.workerPool <- struct{}{}
 			}
-			close(b.workerPool) // Close workerPool after all workers are done.
-			return              // Exit the runCollector goroutine.
+			close(b.workerPool)
+			return
 
 		case <-ticker.C: // batchInterval has elapsed.
-			if len(currentBatchItems) > 0 {
-				b.dispatchBatchProcessing(currentBatchItems) // Dispatch as a non-blocking call.
-				currentBatchItems = nil                      // Reset for the next batch.
+			allBatches := b.batchManager.FlushAllBatches()
+			for _, batch := range allBatches {
+				if len(batch) > 0 {
+					b.dispatchBatchProcessing(batch)
+				}
 			}
 
-		case item, ok := <-b.itemChannel: // A new item has been submitted.
+		case item, ok := <-b.itemChannel:
 			if !ok {
-				// itemChannel was closed, likely by Stop(). The stopChan case will handle shutdown.
 				continue
 			}
-			currentBatchItems = append(currentBatchItems, item)
-			if len(currentBatchItems) >= b.maxBatchSize { // Batch is full.
-				b.dispatchBatchProcessing(currentBatchItems) // Dispatch as a non-blocking call.
-				currentBatchItems = nil                      // Reset for the next batch.
+
+			// Determine the key for batching
+			var key string
+			if b.config.KeyFunc != nil {
+				key = b.config.KeyFunc(item.Input)
+			} else {
+				key = "" // Use empty string for non-sharded mode
+			}
+
+			// Add item to batch manager and check if batch is ready
+			readyBatch := b.batchManager.AddItem(key, item, b.maxBatchSize)
+			if readyBatch != nil {
+				// Batch is ready due to size - process it and reset the ticker
+				b.dispatchBatchProcessing(readyBatch)
+
+				// Reset the ticker to avoid unnecessary flushes too soon after this batch
+				ticker.Reset(b.batchInterval)
 			}
 		}
 	}
@@ -312,3 +359,6 @@ func (b *Batcher[T, Q]) Stop() {
 	// The runCollector goroutine will handle processing remaining items and then
 	// ensure all worker goroutines complete before closing b.workerPool and exiting.
 }
+
+// runCleanup runs in a separate goroutine and periodically sends cleanup requests
+// to the main collector goroutine via a channel, avoiding the need for locks.

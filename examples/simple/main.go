@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/karangupta31/go-sluice/sluice"
+	"github.com/karangupta31/go-sluice"
 )
 
 // User represents the data structure for user details.
