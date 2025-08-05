@@ -12,8 +12,8 @@ The `sluice.Batcher` is the core component, designed for ease of use and efficie
 *   **Concurrent:** Processes multiple batches concurrently using a configurable worker pool.
 *   **Configurable Batching:** Triggers batch processing based on:
     *   Maximum batch size.
-    *   Time interval (batch window).
-*   **Smart Sharding:** Group items by custom keys (e.g., experiment ID, user type) to control which items are batched together.
+    *   Time interval (batch window) - with per-key timers when sharding is enabled.
+*   **Smart Sharding:** Group items by custom keys (e.g., experiment ID, user type) to control which items are batched together. Each shard gets its own independent timer.
 *   **Memory Efficient:** Automatic cleanup of inactive batch keys to prevent memory leaks when using many different keys over time.
 *   **ID Correlation:** Submitted items are given an ID, used by the `BatchFunc` to map results back, ensuring you get the correct output for your input.
 *   **Synchronous Submission:** The `SubmitAndAwait` method provides a simple way to submit an item and block until its specific result is available.
@@ -35,7 +35,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/karangupta31/go-sluice/sluice"
+	"github.com/karangupta31/go-sluice"
 )
 
 // User represents the data structure for user details.
@@ -187,19 +187,13 @@ func main() {
 }
 ```
 
-## Memory Management
+## Memory Management For Sharding use case
 
-The batcher uses a unified map-based approach for both sharded and non-sharded batching:
-
-- **Unified Architecture**: Both sharded (multi-key) and non-sharded (single-key) modes use the same internal map structure, with non-sharded mode simply using a default key
-- **Conditional Cleanup**: Memory management and cleanup logic is only enabled when sharding is used (when `KeyFunc` is provided)
-- **Lock-Free Cleanup**: When enabled, a separate background goroutine coordinates with the main collector via channels to avoid blocking batch processing
 - **LRU Strategy**: Keys that haven't been used recently are eligible for removal
 - **Configurable Thresholds**: 
   - Cleanup only triggers when there are 1000+ keys 
   - Keys must be inactive for 10+ minutes before removal
   - Cleanup runs every 5 minutes
-- **Non-Blocking**: Cleanup requests are sent via buffered channels and won't block if cleanup is already in progress
 - **Only Empty Batches**: Only removes keys for batches that are currently empty (no pending items)
 
 This design ensures optimal performance: non-sharded mode has no cleanup overhead, while sharded mode gets automatic memory management to prevent leaks when using many different keys over time.

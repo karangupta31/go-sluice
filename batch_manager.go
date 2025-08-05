@@ -25,6 +25,15 @@ type BatchManager[T any, Q any] struct {
 	// keyLastUsed tracks when each key was last accessed for LRU cleanup
 	keyLastUsed map[string]time.Time
 
+	// Batch configuration
+	maxBatchSize int
+
+	// Timer management for batch flushing
+	keyTimers       map[string]*time.Timer
+	triggerChannel  chan string
+	batchInterval   time.Duration
+	timerEnabled    bool // true if batchInterval > 0
+
 	// Cleanup configuration and channels (only used when cleanup is enabled)
 	cleanupEnabled       bool
 	cleanupWg            sync.WaitGroup // For cleanup goroutine lifecycle
@@ -38,11 +47,20 @@ type BatchManager[T any, Q any] struct {
 // NewBatchManager creates a new BatchManager using a unified map-based approach.
 // If cleanupEnabled is true, it starts the cleanup goroutine for memory management.
 // If cleanupEnabled is false, it uses the same map structure but without cleanup overhead.
-func NewBatchManager[T any, Q any](cleanupEnabled bool, cleanupConfig *CleanupConfig) *BatchManager[T, Q] {
+func NewBatchManager[T any, Q any](cleanupEnabled bool, cleanupConfig *CleanupConfig, triggerChannel chan string, batchInterval time.Duration, maxBatchSize int) *BatchManager[T, Q] {
 	bm := &BatchManager[T, Q]{
 		batches:        make(map[string][]BatchItem[T, Q]),
 		keyLastUsed:    make(map[string]time.Time),
 		cleanupEnabled: cleanupEnabled,
+		
+		// Batch configuration
+		maxBatchSize: maxBatchSize,
+		
+		// Timer management
+		keyTimers:      make(map[string]*time.Timer),
+		triggerChannel: triggerChannel,
+		batchInterval:  batchInterval,
+		timerEnabled:   batchInterval > 0,
 	}
 
 	if cleanupEnabled {
@@ -78,22 +96,103 @@ func NewBatchManager[T any, Q any](cleanupEnabled bool, cleanupConfig *CleanupCo
 
 // AddItem adds an item to the appropriate batch and returns the batch if it's ready for processing.
 // Uses the provided key to determine the batch (or default key for non-sharded mode).
-func (bm *BatchManager[T, Q]) AddItem(key string, item BatchItem[T, Q], maxBatchSize int) []BatchItem[T, Q] {
+// Manages per-key timers and triggers batch processing via the trigger channel.
+func (bm *BatchManager[T, Q]) AddItem(key string, item BatchItem[T, Q]) {
 	// Wait if cleanup is active (only blocks when cleanup is running)
 	bm.cleanupCoordWg.Wait()
 
 	bm.batches[key] = append(bm.batches[key], item)
 	bm.keyLastUsed[key] = time.Now()
 
-	if len(bm.batches[key]) >= maxBatchSize {
-		batch := bm.batches[key]
-		bm.batches[key] = nil
-		return batch
+	// Start timer for this key if timers are enabled and this is the first item
+	if bm.timerEnabled && len(bm.batches[key]) == 1 {
+		bm.startTimerForKey(key)
 	}
-	return nil
+
+	// Check if batch is ready due to size
+	if len(bm.batches[key]) >= bm.maxBatchSize {
+		// Stop the timer since we're dispatching due to size
+		bm.stopTimerForKey(key)
+		
+		// Trigger batch processing
+		select {
+		case bm.triggerChannel <- key:
+		default:
+			// If trigger channel is full, we skip this notification
+			// The batch will still be available when FlushBatch is called
+		}
+	}
+}
+
+// startTimerForKey starts a timer for the given key.
+// When the timer expires, it sends the key to the trigger channel only if the batch is not empty.
+func (bm *BatchManager[T, Q]) startTimerForKey(key string) {
+	if !bm.timerEnabled {
+		return
+	}
+	
+	// Check if timer already exists for this key
+	if timer, exists := bm.keyTimers[key]; exists {
+		// Reset existing timer
+		timer.Reset(bm.batchInterval)
+	} else {
+		// Create a new timer
+		bm.keyTimers[key] = time.AfterFunc(bm.batchInterval, func() {
+			// Timer expired - check if batch is not empty before triggering
+			bm.cleanupCoordWg.Wait() // Wait if cleanup is active
+			if len(bm.batches[key]) > 0 {
+				select {
+				case bm.triggerChannel <- key:
+				default:
+					// If trigger channel is full, we skip this notification
+				}
+			}
+		})
+	}
+}
+
+// stopTimerForKey stops the timer for the given key but keeps it in the map for reuse.
+func (bm *BatchManager[T, Q]) stopTimerForKey(key string) {
+	if timer, exists := bm.keyTimers[key]; exists {
+		timer.Stop()
+		// Don't delete from map - keep for reuse
+	}
+}
+
+// deleteTimerForKey permanently removes the timer for the given key.
+// This should only be called during cleanup or shutdown.
+func (bm *BatchManager[T, Q]) deleteTimerForKey(key string) {
+	if timer, exists := bm.keyTimers[key]; exists {
+		timer.Stop()
+		delete(bm.keyTimers, key)
+	}
+}
+
+// TriggerAllBatches sends all keys with non-empty batches to the trigger channel.
+// This allows the main runCollector loop to process all remaining batches using
+// the standard trigger channel mechanism for consistency.
+func (bm *BatchManager[T, Q]) TriggerAllBatches() {
+	// Wait if cleanup is active (only blocks when cleanup is running)
+	bm.cleanupCoordWg.Wait()
+
+	for key := range bm.batches {
+		if len(bm.batches[key]) > 0 {
+			// Stop the timer since we're triggering all batches
+			bm.stopTimerForKey(key)
+			
+			// Send to trigger channel (non-blocking)
+			select {
+			case bm.triggerChannel <- key:
+			default:
+				// If trigger channel is full, continue anyway
+				// The batch will still be available when FlushBatch is called
+			}
+		}
+	}
 }
 
 // FlushBatch returns and clears the batch for the given key if it has items.
+// Also stops any active timer for the key.
 func (bm *BatchManager[T, Q]) FlushBatch(key string) []BatchItem[T, Q] {
 	// Wait if cleanup is active (only blocks when cleanup is running)
 	bm.cleanupCoordWg.Wait()
@@ -102,26 +201,31 @@ func (bm *BatchManager[T, Q]) FlushBatch(key string) []BatchItem[T, Q] {
 		batch := bm.batches[key]
 		bm.batches[key] = nil
 		bm.keyLastUsed[key] = time.Now()
+		
+		// Stop the timer since we're flushing the batch
+		bm.stopTimerForKey(key)
+		
 		return batch
 	}
 	return nil
 }
 
 // FlushAllBatches returns all non-empty batches and clears them.
+// Uses FlushBatch internally to ensure consistent behavior.
 func (bm *BatchManager[T, Q]) FlushAllBatches() [][]BatchItem[T, Q] {
 	// Wait if cleanup is active (only blocks when cleanup is running)
 	bm.cleanupCoordWg.Wait()
 
 	var allBatches [][]BatchItem[T, Q]
-	now := time.Now()
 
-	for key, batch := range bm.batches {
+	// Iterate directly over the map and flush each batch
+	for key := range bm.batches {
+		batch := bm.FlushBatch(key)
 		if len(batch) > 0 {
 			allBatches = append(allBatches, batch)
-			bm.batches[key] = nil
-			bm.keyLastUsed[key] = now
 		}
 	}
+
 	return allBatches
 }
 
@@ -139,6 +243,7 @@ func (bm *BatchManager[T, Q]) GetAllKeys() []string {
 
 // Stop gracefully shuts down the BatchManager.
 // If cleanup is enabled, it stops the cleanup goroutine and clears all data.
+// Also stops all active timers.
 func (bm *BatchManager[T, Q]) Stop() {
 	if bm.cleanupEnabled {
 		// Stop cleanup goroutine and clear maps
@@ -146,9 +251,15 @@ func (bm *BatchManager[T, Q]) Stop() {
 		bm.cleanupWg.Wait()
 	}
 
+	// Stop all active timers
+	for key := range bm.keyTimers {
+		bm.deleteTimerForKey(key)
+	}
+
 	// Clear all data
 	bm.batches = nil
 	bm.keyLastUsed = nil
+	bm.keyTimers = nil
 }
 
 // runCleanup runs in a separate goroutine and handles cleanup requests.
@@ -213,6 +324,8 @@ func (bm *BatchManager[T, Q]) performCleanup() {
 		for _, key := range keysToRemove {
 			delete(bm.batches, key)
 			delete(bm.keyLastUsed, key)
+			// Also permanently delete the timer for this key
+			bm.deleteTimerForKey(key)
 		}
 	}
 }

@@ -28,7 +28,7 @@ func main() {
 	// 1. Define your batch processing function
 	// This simulates calling an API that takes multiple users for the same experiment
 	batchFetchVariants := func(requests []Request, commonArgs ...interface{}) (map[string]Response, error) {
-		fmt.Printf("BatchFunc: Processing batch of %d requests for experiment: %s\n", 
+		fmt.Printf("BatchFunc: Processing batch of %d requests for experiment: %s\n",
 			len(requests), requests[0].ExperimentID)
 
 		// Simulate API call latency
@@ -38,10 +38,10 @@ func main() {
 		for i, req := range requests {
 			// Create unique ID for each request
 			id := fmt.Sprintf("%s-%s", req.ExperimentID, req.UserID)
-			
+
 			// Simulate different variants for different users
 			variant := fmt.Sprintf("variant_%d", (i%3)+1)
-			
+
 			results[id] = Response{
 				ExperimentID: req.ExperimentID,
 				UserID:       req.UserID,
@@ -90,21 +90,21 @@ func main() {
 		wg.Add(1)
 		go func(r Request) {
 			defer wg.Done()
-			
+
 			// Create unique ID for correlation
 			id := fmt.Sprintf("%s-%s", r.ExperimentID, r.UserID)
-			
+
 			fmt.Printf("Submitting: %s\n", id)
-			
+
 			response, err := batcher.SubmitAndAwait(id, r)
 			if err != nil {
 				log.Printf("Error for %s: %v\n", id, err)
 				return
 			}
-			
+
 			fmt.Printf("Received response for %s: %+v\n", id, response)
 		}(req)
-		
+
 		// Small delay to show batching behavior
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -114,7 +114,7 @@ func main() {
 
 	// Notice in the output:
 	// - Requests for exp_123 are processed together in one batch
-	// - Requests for exp_456 are processed together in another batch  
+	// - Requests for exp_456 are processed together in another batch
 	// - Request for exp_789 is processed in its own batch
 	// This is much more efficient than calling the API separately for each request!
 }

@@ -3,6 +3,7 @@ package sluice
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -468,8 +469,8 @@ func TestBatcher_ShardingByKey(t *testing.T) {
 	// Submit items with different experiment prefixes
 	items := []string{
 		"exp1_user1", "exp1_user2", "exp1_user3", // Should be grouped together
-		"exp2_user1", "exp2_user2",               // Should be grouped together
-		"exp3_user1",                             // Single item batch
+		"exp2_user1", "exp2_user2", // Should be grouped together
+		"exp3_user1", // Single item batch
 	}
 
 	var wg sync.WaitGroup
@@ -750,7 +751,8 @@ func TestBatchManager_UnifiedApproach(t *testing.T) {
 
 	// Test non-sharded mode (cleanup disabled)
 	t.Run("NonShardedMode", func(t *testing.T) {
-		bm := NewBatchManager[string, string](false, nil) // cleanup disabled
+		triggerChannel := make(chan string, 10)
+		bm := NewBatchManager[string, string](false, nil, triggerChannel, 100*time.Millisecond, 2) // cleanup disabled
 		defer bm.Stop()
 
 		// Create a sample item
@@ -762,9 +764,14 @@ func TestBatchManager_UnifiedApproach(t *testing.T) {
 		}
 
 		// Add item with empty key (default for non-sharded)
-		batch := bm.AddItem("", item, 2)
-		if batch != nil {
-			t.Error("Expected nil batch since we haven't reached max size")
+		bm.AddItem("", item)
+
+		// Should not trigger yet since we haven't reached max size
+		select {
+		case <-triggerChannel:
+			t.Error("Expected no trigger since we haven't reached max size")
+		case <-time.After(50 * time.Millisecond):
+			// Expected - no trigger yet
 		}
 
 		// Add another item to trigger batch
@@ -775,7 +782,20 @@ func TestBatchManager_UnifiedApproach(t *testing.T) {
 			Error:  make(chan error, 1),
 		}
 
-		batch = bm.AddItem("", item2, 2)
+		bm.AddItem("", item2)
+
+		// Should trigger now due to size
+		select {
+		case key := <-triggerChannel:
+			if key != "" {
+				t.Errorf("Expected empty key for non-sharded mode, got %s", key)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Error("Expected trigger due to batch size")
+		}
+
+		// Flush and verify batch contents
+		batch := bm.FlushBatch("")
 		if batch == nil || len(batch) != 2 {
 			t.Errorf("Expected batch of size 2, got %v", batch)
 		}
@@ -793,7 +813,8 @@ func TestBatchManager_UnifiedApproach(t *testing.T) {
 			KeyInactiveThreshold: 1 * time.Second,
 			CleanupInterval:      100 * time.Millisecond,
 		}
-		bm := NewBatchManager[string, string](true, config) // cleanup enabled
+		triggerChannel := make(chan string, 10)
+		bm := NewBatchManager[string, string](true, config, triggerChannel, 500*time.Millisecond, 2) // cleanup enabled, long timer
 		defer bm.Stop()
 
 		// Create items with different keys
@@ -812,14 +833,24 @@ func TestBatchManager_UnifiedApproach(t *testing.T) {
 		}
 
 		// Add items with different keys
-		batch := bm.AddItem("key1", item1, 2)
-		if batch != nil {
-			t.Error("Expected nil batch since we haven't reached max size for key1")
+		bm.AddItem("key1", item1)
+
+		// Should not trigger yet
+		select {
+		case <-triggerChannel:
+			t.Error("Expected no trigger since we haven't reached max size for key1")
+		case <-time.After(50 * time.Millisecond):
+			// Expected - no trigger yet
 		}
 
-		batch = bm.AddItem("key2", item2, 2)
-		if batch != nil {
-			t.Error("Expected nil batch since we haven't reached max size for key2")
+		bm.AddItem("key2", item2)
+
+		// Should still not trigger
+		select {
+		case <-triggerChannel:
+			t.Error("Expected no trigger since we haven't reached max size for key2")
+		case <-time.After(50 * time.Millisecond):
+			// Expected - no trigger yet
 		}
 
 		// Add another item to key1 to trigger batch
@@ -830,7 +861,20 @@ func TestBatchManager_UnifiedApproach(t *testing.T) {
 			Error:  make(chan error, 1),
 		}
 
-		batch = bm.AddItem("key1", item3, 2)
+		bm.AddItem("key1", item3)
+
+		// Should trigger now for key1
+		select {
+		case key := <-triggerChannel:
+			if key != "key1" {
+				t.Errorf("Expected trigger for key1, got %s", key)
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Error("Expected trigger for key1 due to batch size")
+		}
+
+		// Flush and verify the batch contains the right items
+		batch := bm.FlushBatch("key1")
 		if batch == nil || len(batch) != 2 {
 			t.Errorf("Expected batch of size 2 for key1, got %v", batch)
 		}
@@ -868,7 +912,7 @@ func TestBatcher_TickerResetOnSizeBatch(t *testing.T) {
 		batchTimestamps = append(batchTimestamps, time.Now())
 		batchSizes = append(batchSizes, len(inputs))
 		mu.Unlock()
-		
+
 		results := make(map[string]string)
 		for _, input := range inputs {
 			id := "id-" + input
@@ -892,7 +936,7 @@ func TestBatcher_TickerResetOnSizeBatch(t *testing.T) {
 	// Submit 2 items quickly using goroutines to avoid blocking
 	var wg sync.WaitGroup
 	wg.Add(2)
-	
+
 	go func() {
 		defer wg.Done()
 		_, err := b.SubmitAndAwait("id-item1", "item1")
@@ -900,7 +944,7 @@ func TestBatcher_TickerResetOnSizeBatch(t *testing.T) {
 			t.Errorf("Error submitting item1: %v", err)
 		}
 	}()
-	
+
 	go func() {
 		defer wg.Done()
 		_, err := b.SubmitAndAwait("id-item2", "item2")
@@ -908,17 +952,17 @@ func TestBatcher_TickerResetOnSizeBatch(t *testing.T) {
 			t.Errorf("Error submitting item2: %v", err)
 		}
 	}()
-	
+
 	wg.Wait()
 
 	// Wait a moment for the batch to be processed
 	time.Sleep(50 * time.Millisecond)
-	
+
 	// Submit one more item and wait for ticker-based flush
 	go func() {
 		_, _ = b.SubmitAndAwait("id-item3", "item3")
 	}()
-	
+
 	// Wait longer than the original interval would have been
 	time.Sleep(300 * time.Millisecond)
 
@@ -937,7 +981,7 @@ func TestBatcher_TickerResetOnSizeBatch(t *testing.T) {
 	if sizes[0] != 2 {
 		t.Errorf("First batch should have 2 items (size-based), got %d", sizes[0])
 	}
-	
+
 	firstBatchTime := timestamps[0].Sub(start)
 	if firstBatchTime > 100*time.Millisecond {
 		t.Errorf("First batch took too long: %v", firstBatchTime)
@@ -947,7 +991,7 @@ func TestBatcher_TickerResetOnSizeBatch(t *testing.T) {
 	if sizes[1] != 1 {
 		t.Errorf("Second batch should have 1 item (timer-based), got %d", sizes[1])
 	}
-	
+
 	// If ticker wasn't reset, it would have fired much sooner
 	secondBatchTime := timestamps[1].Sub(timestamps[0])
 	if secondBatchTime < 150*time.Millisecond { // Allow some tolerance
@@ -956,4 +1000,288 @@ func TestBatcher_TickerResetOnSizeBatch(t *testing.T) {
 	if secondBatchTime > 300*time.Millisecond { // But not too late
 		t.Errorf("Second batch took too long: %v", secondBatchTime)
 	}
+}
+
+// TestBatcher_TimerBasedBatching tests that batches are triggered by timers when not full
+func TestBatcher_TimerBasedBatching(t *testing.T) {
+	t.Parallel()
+
+	config := BatchProcessorConfig[string, string]{
+		Func: func(inputs []string, commonArgs ...interface{}) (map[string]string, error) {
+			results := make(map[string]string)
+			for i, input := range inputs {
+				results[fmt.Sprintf("id_%d", i)] = fmt.Sprintf("processed_%s", input)
+			}
+			return results, nil
+		},
+	}
+
+	// Use a small batch interval to make the test faster
+	batcher := NewBatcher(config, 100*time.Millisecond, 5, 2)
+	defer batcher.Stop()
+
+	// Submit just one item (won't trigger size-based batching)
+	start := time.Now()
+	result, err := batcher.SubmitAndAwait("id_0", "test_input")
+	duration := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if result != "processed_test_input" {
+		t.Errorf("Expected 'processed_test_input', got '%s'", result)
+	}
+
+	// Verify it took approximately the batch interval time (timer-based)
+	expectedMin := 90 * time.Millisecond  // Allow some tolerance
+	expectedMax := 200 * time.Millisecond // Allow some tolerance
+	if duration < expectedMin || duration > expectedMax {
+		t.Errorf("Expected duration between %v and %v, got %v", expectedMin, expectedMax, duration)
+	}
+
+	t.Logf("Timer-based batch completed in %v", duration)
+}
+
+// TestBatcher_TimerBasedBatchingWithSharding tests timer-based batching with multiple keys
+func TestBatcher_TimerBasedBatchingWithSharding(t *testing.T) {
+	t.Parallel()
+
+	config := BatchProcessorConfig[string, string]{
+		Func: func(inputs []string, commonArgs ...interface{}) (map[string]string, error) {
+			results := make(map[string]string)
+			for _, input := range inputs {
+				// Use the input itself as the basis for the ID lookup
+				// We'll pass IDs that match the expected pattern
+				results[input] = fmt.Sprintf("processed_%s", input)
+			}
+			return results, nil
+		},
+		KeyFunc: func(item string) string {
+			// Shard by prefix (e.g., "user1_data" -> "user1")
+			parts := strings.Split(item, "_")
+			if len(parts) > 0 {
+				return parts[0]
+			}
+			return "default"
+		},
+	}
+
+	// Use a small batch interval and large batch size to ensure timer triggers
+	batcher := NewBatcher(config, 100*time.Millisecond, 10, 2)
+	defer batcher.Stop()
+
+	// Submit items to different shards simultaneously
+	var wg sync.WaitGroup
+	results := make([]string, 2)
+	errors := make([]error, 2)
+
+	wg.Add(2)
+	start := time.Now()
+
+	// Submit to user1 shard
+	go func() {
+		defer wg.Done()
+		result, err := batcher.SubmitAndAwait("user1_data", "user1_data")
+		results[0] = result
+		errors[0] = err
+	}()
+
+	// Submit to user2 shard
+	go func() {
+		defer wg.Done()
+		result, err := batcher.SubmitAndAwait("user2_data", "user2_data")
+		results[1] = result
+		errors[1] = err
+	}()
+
+	wg.Wait()
+	duration := time.Since(start)
+
+	// Check results
+	for i := 0; i < 2; i++ {
+		if errors[i] != nil {
+			t.Fatalf("Unexpected error for item %d: %v", i, errors[i])
+		}
+	}
+
+	if results[0] != "processed_user1_data" {
+		t.Errorf("Expected 'processed_user1_data', got '%s'", results[0])
+	}
+	if results[1] != "processed_user2_data" {
+		t.Errorf("Expected 'processed_user2_data', got '%s'", results[1])
+	}
+
+	// Both should complete around the same time due to independent timers
+	expectedMin := 90 * time.Millisecond
+	expectedMax := 200 * time.Millisecond
+	if duration < expectedMin || duration > expectedMax {
+		t.Errorf("Expected duration between %v and %v, got %v", expectedMin, expectedMax, duration)
+	}
+
+	t.Logf("Timer-based sharded batching completed in %v", duration)
+}
+
+// TestBatcher_DisabledTimers tests that no timers are created when batchInterval is 0
+func TestBatcher_DisabledTimers(t *testing.T) {
+	t.Parallel()
+
+	config := BatchProcessorConfig[string, string]{
+		Func: func(inputs []string, commonArgs ...interface{}) (map[string]string, error) {
+			results := make(map[string]string)
+			for _, input := range inputs {
+				results[input] = fmt.Sprintf("processed_%s", input)
+			}
+			return results, nil
+		},
+	}
+
+	// Use batchInterval = 0 to disable timers
+	batcher := NewBatcher(config, 0, 2, 2)
+	defer batcher.Stop()
+
+	// Submit one item - should not be processed until we hit batch size
+	start := time.Now()
+
+	// Use a goroutine to submit both items
+	var wg sync.WaitGroup
+	var result1, result2 string
+	var err1, err2 error
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		result1, err1 = batcher.SubmitAndAwait("item1", "item1")
+	}()
+
+	// Wait a bit to ensure first item is queued
+	time.Sleep(50 * time.Millisecond)
+
+	// Submit second item to trigger batch processing by size
+	go func() {
+		defer wg.Done()
+		result2, err2 = batcher.SubmitAndAwait("item2", "item2")
+	}()
+
+	wg.Wait()
+	duration := time.Since(start)
+
+	if err1 != nil || err2 != nil {
+		t.Fatalf("Unexpected errors: %v, %v", err1, err2)
+	}
+
+	if result1 != "processed_item1" || result2 != "processed_item2" {
+		t.Errorf("Expected processed results, got %s, %s", result1, result2)
+	}
+
+	// Should complete quickly (no timer delay)
+	if duration > 100*time.Millisecond {
+		t.Errorf("Expected quick completion without timer, took %v", duration)
+	}
+
+	t.Logf("Size-only batching (no timers) completed in %v", duration)
+}
+
+// TestBatcher_TimerResetOptimization tests that timers are reused efficiently
+func TestBatcher_TimerResetOptimization(t *testing.T) {
+	t.Parallel()
+
+	config := BatchProcessorConfig[string, string]{
+		Func: func(inputs []string, commonArgs ...interface{}) (map[string]string, error) {
+			results := make(map[string]string)
+			for _, input := range inputs {
+				results[input] = fmt.Sprintf("processed_%s", input)
+			}
+			return results, nil
+		},
+		KeyFunc: func(item string) string {
+			return "test_key" // All items go to same key to test timer reuse
+		},
+	}
+
+	// Use a longer interval and large batch size to ensure timer resets happen
+	batcher := NewBatcher(config, 200*time.Millisecond, 10, 2)
+	defer batcher.Stop()
+
+	// Submit multiple items rapidly to the same key
+	// This should cause timer resets without creating new timers
+	var wg sync.WaitGroup
+	results := make([]string, 3)
+	errors := make([]error, 3)
+
+	// Submit items with small delays between them
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			time.Sleep(time.Duration(idx*30) * time.Millisecond) // Stagger submissions
+			result, err := batcher.SubmitAndAwait(fmt.Sprintf("item%d", idx), fmt.Sprintf("item%d", idx))
+			results[idx] = result
+			errors[idx] = err
+		}(i)
+	}
+
+	start := time.Now()
+	wg.Wait()
+	duration := time.Since(start)
+
+	// Check all results
+	for i := 0; i < 3; i++ {
+		if errors[i] != nil {
+			t.Fatalf("Unexpected error for item %d: %v", i, errors[i])
+		}
+		expected := fmt.Sprintf("processed_item%d", i)
+		if results[i] != expected {
+			t.Errorf("Expected %s, got %s", expected, results[i])
+		}
+	}
+
+	// Should complete around the timer interval (timer should have been reset multiple times)
+	expectedMin := 180 * time.Millisecond
+	expectedMax := 250 * time.Millisecond
+	if duration < expectedMin || duration > expectedMax {
+		t.Errorf("Expected duration between %v and %v, got %v", expectedMin, expectedMax, duration)
+	}
+
+	t.Logf("Timer reset optimization test completed in %v", duration)
+}
+
+// TestBatcher_TimerDoesNotTriggerEmptyBatch tests that timers don't trigger if batch becomes empty
+func TestBatcher_TimerDoesNotTriggerEmptyBatch(t *testing.T) {
+	t.Parallel()
+
+	triggerChannel := make(chan string, 10)
+	bm := NewBatchManager[string, string](false, nil, triggerChannel, 100*time.Millisecond, 2)
+	defer bm.Stop()
+
+	// Create and add an item
+	item := BatchItem[string, string]{
+		ID:     "test1",
+		Input:  "testInput",
+		Output: make(chan string, 1),
+		Error:  make(chan error, 1),
+	}
+
+	// Add item (this starts the timer)
+	bm.AddItem("test_key", item)
+
+	// Immediately flush the batch (making it empty)
+	batch := bm.FlushBatch("test_key")
+	if len(batch) != 1 {
+		t.Errorf("Expected batch of size 1, got %d", len(batch))
+	}
+
+	// Wait longer than the timer interval
+	time.Sleep(150 * time.Millisecond)
+
+	// Timer should not have triggered since batch is now empty
+	select {
+	case key := <-triggerChannel:
+		t.Errorf("Timer should not have triggered for empty batch, but got trigger for key: %s", key)
+	default:
+		// Expected - no trigger should occur
+	}
+
+	t.Log("Timer correctly did not trigger for empty batch")
 }

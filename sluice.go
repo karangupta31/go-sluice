@@ -2,7 +2,6 @@ package sluice
 
 import (
 	"fmt"
-	"log"
 	"time"
 )
 
@@ -99,6 +98,7 @@ type Batcher[T any, Q any] struct {
 //	               If less than or equal to 0, it defaults to 1.
 //
 // Returns a pointer to the newly created Batcher.
+
 func NewBatcher[T any, Q any](config BatchProcessorConfig[T, Q], batchInterval time.Duration, maxBatchSize int, numWorkers int) *Batcher[T, Q] {
 	if numWorkers <= 0 {
 		numWorkers = 1 // Default to at least one worker.
@@ -118,19 +118,17 @@ func NewBatcher[T any, Q any](config BatchProcessorConfig[T, Q], batchInterval t
 
 	// Always initialize batch manager, with cleanup enabled only if KeyFunc is provided
 	cleanupEnabled := config.KeyFunc != nil
-	b.batchManager = NewBatchManager[T, Q](cleanupEnabled, config.CleanupConfig)
+	triggerChannel := make(chan string, 100) // Buffered channel for batch ready notifications
+	b.batchManager = NewBatchManager[T, Q](cleanupEnabled, config.CleanupConfig, triggerChannel, batchInterval, maxBatchSize)
 
-	go b.runCollector() // Start the main batch collection loop.
+	go b.runCollector(triggerChannel) // Start the main batch collection loop.
 	return b
 }
 
 // runCollector is the main loop for the Batcher. It runs in a separate goroutine.
 // It collects items from itemChannel and forms batches based on maxBatchSize or batchInterval.
 // It also handles graceful shutdown when stopChan is closed.
-func (b *Batcher[T, Q]) runCollector() {
-	ticker := time.NewTicker(b.batchInterval)
-	defer ticker.Stop()
-
+func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 	for {
 		select {
 		case <-b.stopChan: // Signal to stop the batcher.
@@ -150,12 +148,11 @@ func (b *Batcher[T, Q]) runCollector() {
 			close(b.workerPool)
 			return
 
-		case <-ticker.C: // batchInterval has elapsed.
-			allBatches := b.batchManager.FlushAllBatches()
-			for _, batch := range allBatches {
-				if len(batch) > 0 {
-					b.dispatchBatchProcessing(batch)
-				}
+		case batchKey := <-triggerChannel:
+			// A batch is ready (either by size or timer)
+			batch := b.batchManager.FlushBatch(batchKey)
+			if len(batch) > 0 {
+				b.dispatchBatchProcessing(batch)
 			}
 
 		case item, ok := <-b.itemChannel:
@@ -171,15 +168,8 @@ func (b *Batcher[T, Q]) runCollector() {
 				key = "" // Use empty string for non-sharded mode
 			}
 
-			// Add item to batch manager and check if batch is ready
-			readyBatch := b.batchManager.AddItem(key, item, b.maxBatchSize)
-			if readyBatch != nil {
-				// Batch is ready due to size - process it and reset the ticker
-				b.dispatchBatchProcessing(readyBatch)
-
-				// Reset the ticker to avoid unnecessary flushes too soon after this batch
-				ticker.Reset(b.batchInterval)
-			}
+			// Add item to batch manager - it handles timer management internally
+			b.batchManager.AddItem(key, item)
 		}
 	}
 }
@@ -206,147 +196,82 @@ func (b *Batcher[T, Q]) dispatchBatchProcessing(batchToProcess []BatchItem[T, Q]
 	}()
 }
 
-// processBatch executes the user-defined BatchFunc with the items in the batch.
-// It handles sending results or errors back to the respective channels of each BatchItem.
-// It also recovers from panics in the BatchFunc and ensures item channels are closed.
 func (b *Batcher[T, Q]) processBatch(batch []BatchItem[T, Q]) {
-	panicked := true // Assume a panic might occur until BatchFunc completes successfully.
+	var panicErr error
+	
 	defer func() {
-		// This defer block ensures that:
-		// 1. Panics from BatchFunc are recovered.
-		// 2. If a panic occurred, an error is sent to all items in the batch.
-		// 3. Output and Error channels for all items in this batch are closed,
-		//    signaling completion to callers of SubmitAndAwait.
+		// Handle panic and send error to all items
 		if r := recover(); r != nil {
-			log.Printf("Sluice.Batcher: Recovered from panic during BatchFunc execution: %v", r)
-			if panicked { // If panic happened before BatchFunc returned or handled its own errors.
-				batchErr := fmt.Errorf("sluice.Batcher: panic during batch processing: %v", r)
-				for _, item := range batch {
-					select {
-					case item.Error <- batchErr:
-					default:
-					} // Non-blocking send.
-					select {
-					case item.Output <- *new(Q):
-					default:
-					} // Send zero value for output.
-				}
+			panicErr = fmt.Errorf("sluice.Batcher: panic during batch processing: %v", r)
+			for _, item := range batch {
+				item.Error <- panicErr
+				item.Output <- *new(Q)
 			}
 		}
-		// Always close the item's channels to unblock SubmitAndAwait,
-		// regardless of success, error, or panic.
+		
+		// Always close channels last
 		for _, item := range batch {
 			close(item.Output)
 			close(item.Error)
 		}
 	}()
 
-	if len(batch) == 0 { // Should ideally be caught by dispatchBatchProcessing.
-		panicked = false
+	if len(batch) == 0 {
 		return
 	}
 
-	// Prepare inputs for the BatchFunc.
+	// Prepare inputs
 	inputs := make([]T, len(batch))
 	for i, item := range batch {
 		inputs[i] = item.Input
 	}
 
-	// Execute the user's batch processing function.
-	outputs, batchErr := b.config.Func(inputs, b.config.CommonArgs...)
-	panicked = false // BatchFunc completed (either successfully or returned an error).
+	// Execute batch function
+	outputs, err := b.config.Func(inputs, b.config.CommonArgs...)
 
-	if batchErr != nil {
-		// BatchFunc returned a batch-level error. Propagate this error to all items.
-		log.Printf("Sluice.Batcher: Error during BatchFunc execution: %v", batchErr)
+	if err != nil {
+		// Batch-level error
 		for _, item := range batch {
-			item.Error <- batchErr
-			item.Output <- *new(Q) // Send zero value for output on batch error.
+			item.Error <- err
+			item.Output <- *new(Q)
 		}
-		return // Results processing is skipped.
+		return
 	}
 
-	// BatchFunc executed successfully, distribute results to individual items.
+	// Distribute results
 	for _, item := range batch {
 		if result, ok := outputs[item.ID]; ok {
 			item.Output <- result
-			item.Error <- nil // Explicitly send nil error for success.
+			item.Error <- nil
 		} else {
-			// No output found for this item's ID in the BatchFunc's results.
 			item.Error <- fmt.Errorf("sluice.Batcher: no output found for ID %s", item.ID)
-			item.Output <- *new(Q) // Send zero value.
+			item.Output <- *new(Q)
 		}
 	}
 }
 
-// SubmitAndAwait adds an item to the Batcher and blocks until the item has been
-// processed and its result (or an error) is available.
-//
-// Parameters:
-//
-//	id:    A unique string identifier for this item. This ID is used by the BatchFunc
-//	       to map its results back to the specific item.
-//	input: The input data of type T for this item.
-//
-// Returns the processed output of type Q and an error if one occurred during processing
-// or if the Batcher is stopped.
 func (b *Batcher[T, Q]) SubmitAndAwait(id string, input T) (Q, error) {
 	if b.stopped {
 		return *new(Q), fmt.Errorf("sluice.Batcher: Batcher has been stopped, not accepting new items")
 	}
 
-	// Create dedicated channels for this item's result and error.
-	outputChan := make(chan Q, 1)    // Buffered to allow processBatch to send without blocking.
-	errorChan := make(chan error, 1) // Buffered for the same reason.
+	outputChan := make(chan Q, 1)
+	errorChan := make(chan error, 1)
 
-	itemToSubmit := BatchItem[T, Q]{
+	item := BatchItem[T, Q]{
 		ID:     id,
 		Input:  input,
 		Output: outputChan,
 		Error:  errorChan,
 	}
 
-	defer func() {
-		// This defer handles the case where sending to b.itemChannel panics
-		// (e.g., if b.itemChannel is closed by Stop() concurrently).
-		if r := recover(); r != nil {
-			log.Printf("Sluice.Batcher: Recovered from panic in SubmitAndAwait (likely send on closed itemChannel): %v", r)
-			// If the item was not successfully sent to itemChannel, its output/error channels
-			// will not be closed by processBatch. We must close them here to prevent the caller
-			// of SubmitAndAwait from blocking indefinitely.
-			select {
-			case errorChan <- fmt.Errorf("sluice.Batcher: Batcher is stopping or stopped, submission failed: %v", r):
-			default: // Avoid blocking if channel is already full or closed.
-			}
-			select {
-			case outputChan <- *new(Q): // Send zero value.
-			default:
-			}
-			// Ensure these specific channels are closed if this panic path is taken.
-			close(outputChan)
-			close(errorChan)
-		}
-	}()
+	b.itemChannel <- item
 
-	b.itemChannel <- itemToSubmit // Submit the item; this may panic if channel is closed.
-
-	// Wait for the result or an error from the item's dedicated channels.
-	// These channels will be closed by processBatch after sending values or upon error/panic.
-	var q Q
-	var errResult error
-
-	// Read from channels. The order doesn't strictly matter due to buffering and closure.
-	qResult, qOk := <-outputChan
-	errVal, errOk := <-errorChan
-
-	if qOk {
-		q = qResult
-	}
-	if errOk {
-		errResult = errVal
-	}
-
-	return q, errResult
+	// Wait for result
+	result := <-outputChan
+	err := <-errorChan
+	
+	return result, err
 }
 
 // Stop signals the Batcher to cease accepting new items and to process any items
@@ -359,6 +284,3 @@ func (b *Batcher[T, Q]) Stop() {
 	// The runCollector goroutine will handle processing remaining items and then
 	// ensure all worker goroutines complete before closing b.workerPool and exiting.
 }
-
-// runCleanup runs in a separate goroutine and periodically sends cleanup requests
-// to the main collector goroutine via a channel, avoiding the need for locks.
