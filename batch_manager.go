@@ -29,10 +29,10 @@ type BatchManager[T any, Q any] struct {
 	maxBatchSize int
 
 	// Timer management for batch flushing
-	keyTimers       map[string]*time.Timer
-	triggerChannel  chan string
-	batchInterval   time.Duration
-	timerEnabled    bool // true if batchInterval > 0
+	keyTimers      map[string]*time.Timer
+	triggerChannel chan string
+	batchInterval  time.Duration
+	timerEnabled   bool // true if batchInterval > 0
 
 	// Cleanup configuration and channels (only used when cleanup is enabled)
 	cleanupEnabled       bool
@@ -52,10 +52,10 @@ func NewBatchManager[T any, Q any](cleanupEnabled bool, cleanupConfig *CleanupCo
 		batches:        make(map[string][]BatchItem[T, Q]),
 		keyLastUsed:    make(map[string]time.Time),
 		cleanupEnabled: cleanupEnabled,
-		
+
 		// Batch configuration
 		maxBatchSize: maxBatchSize,
-		
+
 		// Timer management
 		keyTimers:      make(map[string]*time.Timer),
 		triggerChannel: triggerChannel,
@@ -113,7 +113,7 @@ func (bm *BatchManager[T, Q]) AddItem(key string, item BatchItem[T, Q]) {
 	if len(bm.batches[key]) >= bm.maxBatchSize {
 		// Stop the timer since we're dispatching due to size
 		bm.stopTimerForKey(key)
-		
+
 		// Trigger batch processing
 		select {
 		case bm.triggerChannel <- key:
@@ -130,7 +130,7 @@ func (bm *BatchManager[T, Q]) startTimerForKey(key string) {
 	if !bm.timerEnabled {
 		return
 	}
-	
+
 	// Check if timer already exists for this key
 	if timer, exists := bm.keyTimers[key]; exists {
 		// Reset existing timer
@@ -168,29 +168,6 @@ func (bm *BatchManager[T, Q]) deleteTimerForKey(key string) {
 	}
 }
 
-// TriggerAllBatches sends all keys with non-empty batches to the trigger channel.
-// This allows the main runCollector loop to process all remaining batches using
-// the standard trigger channel mechanism for consistency.
-func (bm *BatchManager[T, Q]) TriggerAllBatches() {
-	// Wait if cleanup is active (only blocks when cleanup is running)
-	bm.cleanupCoordWg.Wait()
-
-	for key := range bm.batches {
-		if len(bm.batches[key]) > 0 {
-			// Stop the timer since we're triggering all batches
-			bm.stopTimerForKey(key)
-			
-			// Send to trigger channel (non-blocking)
-			select {
-			case bm.triggerChannel <- key:
-			default:
-				// If trigger channel is full, continue anyway
-				// The batch will still be available when FlushBatch is called
-			}
-		}
-	}
-}
-
 // FlushBatch returns and clears the batch for the given key if it has items.
 // Also stops any active timer for the key.
 func (bm *BatchManager[T, Q]) FlushBatch(key string) []BatchItem[T, Q] {
@@ -201,10 +178,10 @@ func (bm *BatchManager[T, Q]) FlushBatch(key string) []BatchItem[T, Q] {
 		batch := bm.batches[key]
 		bm.batches[key] = nil
 		bm.keyLastUsed[key] = time.Now()
-		
+
 		// Stop the timer since we're flushing the batch
 		bm.stopTimerForKey(key)
-		
+
 		return batch
 	}
 	return nil

@@ -198,7 +198,7 @@ func (b *Batcher[T, Q]) dispatchBatchProcessing(batchToProcess []BatchItem[T, Q]
 
 func (b *Batcher[T, Q]) processBatch(batch []BatchItem[T, Q]) {
 	var panicErr error
-	
+
 	defer func() {
 		// Handle panic and send error to all items
 		if r := recover(); r != nil {
@@ -208,7 +208,7 @@ func (b *Batcher[T, Q]) processBatch(batch []BatchItem[T, Q]) {
 				item.Output <- *new(Q)
 			}
 		}
-		
+
 		// Always close channels last
 		for _, item := range batch {
 			close(item.Output)
@@ -270,7 +270,7 @@ func (b *Batcher[T, Q]) SubmitAndAwait(id string, input T) (Q, error) {
 	// Wait for result
 	result := <-outputChan
 	err := <-errorChan
-	
+
 	return result, err
 }
 

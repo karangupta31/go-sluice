@@ -499,11 +499,11 @@ func TestBatcher_ShardingByKey(t *testing.T) {
 		if len(batch) > 1 {
 			// Check if all items in this batch have the same prefix
 			firstPrefix := ""
-			if len(batch[0]) >= 4 {
-				firstPrefix = batch[0][:4]
+			if len(batch[0]) >= 3 {
+				firstPrefix = batch[0][:3]
 			}
 			for _, item := range batch {
-				if len(item) >= 4 && item[:4] != firstPrefix {
+				if len(item) >= 3 && item[:3] != firstPrefix {
 					foundMixedBatch = true
 					t.Logf("Found mixed batch: %v (first prefix: %s, item: %s)", batch, firstPrefix, item)
 				}

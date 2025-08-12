@@ -12,7 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Independent per-shard timers**: Each shard now has its own timer, allowing for true independent batching behavior across different keys
 - **Memory management**: Automatic LRU cleanup for inactive batch keys to prevent memory leaks
 - **Configurable cleanup**: Customizable thresholds for cleanup frequency and key inactivity
-- **Sharding examples**: Complete example demonstrating experiment-based grouping
 
 ### Changed
 - **Trigger-based architecture**: Moved from ticker-based polling to event-driven trigger channels for better responsiveness
