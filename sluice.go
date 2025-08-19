@@ -77,10 +77,6 @@ type Batcher[T any, Q any] struct {
 	workerPool chan struct{}
 	// stopChan is used to signal the Batcher's runCollector goroutine to terminate.
 	stopChan chan struct{}
-	// stopped is a flag that indicates whether the Stop() method has been called,
-	// preventing new submissions.
-	stopped bool
-
 	// batchManager handles batches for both sharded and non-sharded modes.
 	// Cleanup logic is only enabled when sharding is used (KeyFunc != nil).
 	batchManager *BatchManager[T, Q]
@@ -141,6 +137,9 @@ func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 			}
 			b.batchManager.Stop()
 
+			// Close itemChannel to prevent new sends
+			close(b.itemChannel)
+
 			// Wait for all active workers to finish by trying to fill the workerPool.
 			for i := 0; i < cap(b.workerPool); i++ {
 				b.workerPool <- struct{}{}
@@ -157,6 +156,7 @@ func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 
 		case item, ok := <-b.itemChannel:
 			if !ok {
+				// itemChannel was closed, this means we're shutting down
 				continue
 			}
 
@@ -251,8 +251,11 @@ func (b *Batcher[T, Q]) processBatch(batch []BatchItem[T, Q]) {
 }
 
 func (b *Batcher[T, Q]) SubmitAndAwait(id string, input T) (Q, error) {
-	if b.stopped {
+	// Check if stop channel is closed instead of using stopped flag
+	select {
+	case <-b.stopChan:
 		return *new(Q), fmt.Errorf("sluice.Batcher: Batcher has been stopped, not accepting new items")
+	default:
 	}
 
 	outputChan := make(chan Q, 1)
@@ -265,7 +268,13 @@ func (b *Batcher[T, Q]) SubmitAndAwait(id string, input T) (Q, error) {
 		Error:  errorChan,
 	}
 
-	b.itemChannel <- item
+	// Try to send item, but return error if batcher is stopped
+	select {
+	case b.itemChannel <- item:
+		// Successfully sent
+	case <-b.stopChan:
+		return *new(Q), fmt.Errorf("sluice.Batcher: Batcher has been stopped, not accepting new items")
+	}
 
 	// Wait for result
 	result := <-outputChan
@@ -278,9 +287,15 @@ func (b *Batcher[T, Q]) SubmitAndAwait(id string, input T) (Q, error) {
 // already submitted or currently in its internal batch. It then shuts down its
 // worker goroutines gracefully. This method is idempotent.
 func (b *Batcher[T, Q]) Stop() {
-	b.stopped = true     // Set flag to reject new SubmitAndAwait calls immediately.
-	close(b.stopChan)    // Signal runCollector to initiate shutdown.
-	close(b.itemChannel) // Prevent new items from being enqueued and unblocks runCollector's select.
+	// Close stopChan first to signal shutdown
+	select {
+	case <-b.stopChan:
+		// Already stopped
+		return
+	default:
+		close(b.stopChan) // Signal runCollector to initiate shutdown
+		// Don't close itemChannel - let runCollector handle draining
+	}
 	// The runCollector goroutine will handle processing remaining items and then
 	// ensure all worker goroutines complete before closing b.workerPool and exiting.
 }

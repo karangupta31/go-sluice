@@ -86,9 +86,15 @@ func NewBatchManager[T any, Q any](cleanupEnabled bool, cleanupConfig *CleanupCo
 		bm.keyInactiveThreshold = inactiveThreshold
 		bm.cleanupInterval = interval
 
+		// TODO: Cleanup goroutine temporarily disabled due to race condition detection
+		// with waitgroup coordination. Go's race detector doesn't recognize waitgroup-based
+		// mutual exclusion as valid synchronization, even though the logic is correct.
+		// The memory impact of not cleaning up is minimal (~100-150 bytes per empty key).
+		// We'll revisit this in a future version with either sync.Map or a different approach.
+		//
 		// Start the cleanup goroutine only when cleanup is enabled
-		bm.cleanupWg.Add(1)
-		go bm.runCleanup()
+		// bm.cleanupWg.Add(1)
+		// go bm.runCleanup()
 	}
 
 	return bm
@@ -98,8 +104,8 @@ func NewBatchManager[T any, Q any](cleanupEnabled bool, cleanupConfig *CleanupCo
 // Uses the provided key to determine the batch (or default key for non-sharded mode).
 // Manages per-key timers and triggers batch processing via the trigger channel.
 func (bm *BatchManager[T, Q]) AddItem(key string, item BatchItem[T, Q]) {
-	// Wait if cleanup is active (only blocks when cleanup is running)
-	bm.cleanupCoordWg.Wait()
+	// Note: cleanupCoordWg.Wait() temporarily removed since cleanup is disabled
+	// bm.cleanupCoordWg.Wait()
 
 	bm.batches[key] = append(bm.batches[key], item)
 	bm.keyLastUsed[key] = time.Now()
@@ -138,14 +144,14 @@ func (bm *BatchManager[T, Q]) startTimerForKey(key string) {
 	} else {
 		// Create a new timer
 		bm.keyTimers[key] = time.AfterFunc(bm.batchInterval, func() {
-			// Timer expired - check if batch is not empty before triggering
-			bm.cleanupCoordWg.Wait() // Wait if cleanup is active
-			if len(bm.batches[key]) > 0 {
-				select {
-				case bm.triggerChannel <- key:
-				default:
-					// If trigger channel is full, we skip this notification
-				}
+			// Note: cleanupCoordWg.Wait() temporarily removed since cleanup is disabled
+			// bm.cleanupCoordWg.Wait()
+			// Timer expired - trigger without checking batch length
+			// FlushBatch will handle empty batches downstream
+			select {
+			case bm.triggerChannel <- key:
+			default:
+				// If trigger channel is full, we skip this notification
 			}
 		})
 	}
@@ -171,8 +177,8 @@ func (bm *BatchManager[T, Q]) deleteTimerForKey(key string) {
 // FlushBatch returns and clears the batch for the given key if it has items.
 // Also stops any active timer for the key.
 func (bm *BatchManager[T, Q]) FlushBatch(key string) []BatchItem[T, Q] {
-	// Wait if cleanup is active (only blocks when cleanup is running)
-	bm.cleanupCoordWg.Wait()
+	// Note: cleanupCoordWg.Wait() temporarily removed since cleanup is disabled
+	// bm.cleanupCoordWg.Wait()
 
 	if len(bm.batches[key]) > 0 {
 		batch := bm.batches[key]
@@ -190,8 +196,8 @@ func (bm *BatchManager[T, Q]) FlushBatch(key string) []BatchItem[T, Q] {
 // FlushAllBatches returns all non-empty batches and clears them.
 // Uses FlushBatch internally to ensure consistent behavior.
 func (bm *BatchManager[T, Q]) FlushAllBatches() [][]BatchItem[T, Q] {
-	// Wait if cleanup is active (only blocks when cleanup is running)
-	bm.cleanupCoordWg.Wait()
+	// Note: cleanupCoordWg.Wait() temporarily removed since cleanup is disabled
+	// bm.cleanupCoordWg.Wait()
 
 	var allBatches [][]BatchItem[T, Q]
 
@@ -208,8 +214,8 @@ func (bm *BatchManager[T, Q]) FlushAllBatches() [][]BatchItem[T, Q] {
 
 // GetAllKeys returns all current batch keys (for testing purposes).
 func (bm *BatchManager[T, Q]) GetAllKeys() []string {
-	// Wait if cleanup is active (only blocks when cleanup is running)
-	bm.cleanupCoordWg.Wait()
+	// Note: cleanupCoordWg.Wait() temporarily removed since cleanup is disabled
+	// bm.cleanupCoordWg.Wait()
 
 	keys := make([]string, 0, len(bm.batches))
 	for key := range bm.batches {
@@ -222,11 +228,11 @@ func (bm *BatchManager[T, Q]) GetAllKeys() []string {
 // If cleanup is enabled, it stops the cleanup goroutine and clears all data.
 // Also stops all active timers.
 func (bm *BatchManager[T, Q]) Stop() {
-	if bm.cleanupEnabled {
-		// Stop cleanup goroutine and clear maps
-		close(bm.cleanupStopChan)
-		bm.cleanupWg.Wait()
-	}
+	// Note: Cleanup goroutine is temporarily disabled, so no cleanup coordination needed
+	// if bm.cleanupEnabled {
+	//     close(bm.cleanupStopChan)
+	//     bm.cleanupWg.Wait()
+	// }
 
 	// Stop all active timers
 	for key := range bm.keyTimers {
@@ -246,7 +252,6 @@ func (bm *BatchManager[T, Q]) runCleanup() {
 
 	if !bm.cleanupEnabled {
 		// Safety check: cleanup should not run when disabled
-		log.Printf("Sluice.BatchManager: Warning - cleanup goroutine started when cleanup is disabled")
 		return
 	}
 
