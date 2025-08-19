@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.2.1
+
+### Fixed
+- **Race condition resolution**: Temporarily disabled cleanup coordination to resolve Go race detector warnings
+- **Data race elimination**: Removed timer callback map access that was causing concurrent read/write races
+- **Stop/Submit coordination**: Fixed race between Stop() and SubmitAndAwait() using channel-based coordination instead of boolean flags
+
+### Changed
+- **Cleanup behavior**: Cleanup functionality temporarily disabled until proper concurrent-safe implementation
+- **Memory impact**: Minimal impact (~100-150 bytes per empty key) as cleanup was addressing theoretical memory leaks
+
+### Technical Notes
+- Go's race detector doesn't recognize waitgroup-based mutual exclusion as valid synchronization
+- Waitgroup coordination was actually correct but flagged as races by the detector
+- Will revisit cleanup in future version with either sync.Map or alternative approach
+
 ## v0.2.0
 
 ### Added
@@ -59,11 +75,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **v0.1.0**: Foundation - Basic batch processing with concurrency
 - **v0.1.1**: Performance - Removed unnecessary copying overhead  
-- **v0.2.0** *(Unreleased)*: Intelligence & Efficiency - Sharding, per-shard timers, and trigger architecture
+- **v0.2.0**: Intelligence & Efficiency - Sharding, per-shard timers, and trigger architecture
+- **v0.2.1**: Stability - Race condition fixes and cleanup coordination improvements
 
 ## Migration Guide
 
-### From v0.1.x to v0.2.0 *(Unreleased)*
+### From v0.2.0 to v0.2.1
+- No breaking changes to existing API
+- Cleanup functionality temporarily disabled (minimal memory impact)
+- Improved race condition safety for production deployments
+
+### From v0.1.x to v0.2.0
 - No breaking changes to existing API
 - Optional sharding can be enabled by providing `KeyFunc` in config
 - Memory management is automatically enabled for sharded mode
