@@ -124,8 +124,12 @@ func NewBatcher[T any, Q any](config BatchProcessorConfig[T, Q], batchInterval t
 // runCollector is the main loop for the Batcher. It runs in a separate goroutine.
 // It collects items from itemChannel and forms batches based on maxBatchSize or batchInterval.
 // It also handles graceful shutdown when stopChan is closed.
+// Prioritizes stop channel, then trigger channel processing to prevent batch size overflow.
 func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 	for {
+		// Don't remove seperate select for various cases.
+		// Select uses psuedo random order while selecting cases, but we need definite order
+		// PRIORITY 1: Check for shutdown first
 		select {
 		case <-b.stopChan: // Signal to stop the batcher.
 			// Process any remaining items in all batches.
@@ -146,14 +150,23 @@ func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 			}
 			close(b.workerPool)
 			return
+		default:
+		}
 
+		// PRIORITY 2: Process triggers to prevent batch overflow
+		select {
 		case batchKey := <-triggerChannel:
 			// A batch is ready (either by size or timer)
 			batch := b.batchManager.FlushBatch(batchKey)
 			if len(batch) > 0 {
 				b.dispatchBatchProcessing(batch)
 			}
+			continue // Go back to start to check stop and any other triggers
+		default:
+		}
 
+		// PRIORITY 3: Only process items if no triggers are pending
+		select {
 		case item, ok := <-b.itemChannel:
 			if !ok {
 				// itemChannel was closed, this means we're shutting down
@@ -170,6 +183,8 @@ func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 
 			// Add item to batch manager - it handles timer management internally
 			b.batchManager.AddItem(key, item)
+		default:
+			// No items available, continue to next iteration
 		}
 	}
 }
@@ -233,7 +248,7 @@ func (b *Batcher[T, Q]) processBatch(batch []BatchItem[T, Q]) {
 		// Batch-level error
 		for _, item := range batch {
 			item.Error <- err
-			item.Output <- *new(Q)
+			item.Output <- outputs[item.ID]
 		}
 		return
 	}
@@ -245,7 +260,7 @@ func (b *Batcher[T, Q]) processBatch(batch []BatchItem[T, Q]) {
 			item.Error <- nil
 		} else {
 			item.Error <- fmt.Errorf("sluice.Batcher: no output found for ID %s", item.ID)
-			item.Output <- *new(Q)
+			item.Output <- outputs[item.ID]
 		}
 	}
 }
