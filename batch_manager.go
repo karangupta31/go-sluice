@@ -148,11 +148,7 @@ func (bm *BatchManager[T, Q]) startTimerForKey(key string) {
 			// bm.cleanupCoordWg.Wait()
 			// Timer expired - trigger without checking batch length
 			// FlushBatch will handle empty batches downstream
-			select {
-			case bm.triggerChannel <- key:
-			default:
-				// If trigger channel is full, we skip this notification
-			}
+			bm.triggerChannel <- key
 		})
 	}
 }
