@@ -132,23 +132,7 @@ func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 		// PRIORITY 1: Check for shutdown first
 		select {
 		case <-b.stopChan: // Signal to stop the batcher.
-			// Process any remaining items in all batches.
-			allBatches := b.batchManager.FlushAllBatches()
-			for _, batch := range allBatches {
-				if len(batch) > 0 {
-					b.dispatchBatchProcessing(batch)
-				}
-			}
-			b.batchManager.Stop()
-
-			// Close itemChannel to prevent new sends
-			close(b.itemChannel)
-
-			// Wait for all active workers to finish by trying to fill the workerPool.
-			for i := 0; i < cap(b.workerPool); i++ {
-				b.workerPool <- struct{}{}
-			}
-			close(b.workerPool)
+			b.handleStopSignal()
 			return
 		default:
 		}
@@ -156,11 +140,7 @@ func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 		// PRIORITY 2: Process triggers to prevent batch overflow
 		select {
 		case batchKey := <-triggerChannel:
-			// A batch is ready (either by size or timer)
-			batch := b.batchManager.FlushBatch(batchKey)
-			if len(batch) > 0 {
-				b.dispatchBatchProcessing(batch)
-			}
+			b.handleTrigger(batchKey)
 			continue // Go back to start to check stop and any other triggers
 		default:
 		}
@@ -172,21 +152,68 @@ func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 				// itemChannel was closed, this means we're shutting down
 				continue
 			}
-
-			// Determine the key for batching
-			var key string
-			if b.config.KeyFunc != nil {
-				key = b.config.KeyFunc(item.Input)
-			} else {
-				key = "" // Use empty string for non-sharded mode
-			}
-
-			// Add item to batch manager - it handles timer management internally
-			b.batchManager.AddItem(key, item)
+			b.handleItem(item)
 		default:
-			// No items available, continue to next iteration
+			// No work available - use blocking select to avoid busy-wait
+			// This ensures we don't consume CPU when idle
+			select {
+			case <-b.stopChan:
+				b.handleStopSignal()
+				return
+			case batchKey := <-triggerChannel:
+				b.handleTrigger(batchKey)
+			case item, ok := <-b.itemChannel:
+				if !ok {
+					continue
+				}
+				b.handleItem(item)
+			}
 		}
 	}
+}
+
+// handleStopSignal processes the stop channel and performs graceful shutdown
+func (b *Batcher[T, Q]) handleStopSignal() {
+	// Process any remaining items in all batches.
+	allBatches := b.batchManager.FlushAllBatches()
+	for _, batch := range allBatches {
+		if len(batch) > 0 {
+			b.dispatchBatchProcessing(batch)
+		}
+	}
+	b.batchManager.Stop()
+
+	// Close itemChannel to prevent new sends
+	close(b.itemChannel)
+
+	// Wait for all active workers to finish by trying to fill the workerPool.
+	for i := 0; i < cap(b.workerPool); i++ {
+		b.workerPool <- struct{}{}
+	}
+	close(b.workerPool)
+}
+
+// handleTrigger processes a trigger channel message and flushes the corresponding batch
+func (b *Batcher[T, Q]) handleTrigger(batchKey string) {
+	// A batch is ready (either by size or timer)
+	batch := b.batchManager.FlushBatch(batchKey)
+	if len(batch) > 0 {
+		b.dispatchBatchProcessing(batch)
+	}
+}
+
+// handleItem processes an item from the item channel and adds it to the appropriate batch
+func (b *Batcher[T, Q]) handleItem(item BatchItem[T, Q]) {
+	// Determine the key for batching
+	var key string
+	if b.config.KeyFunc != nil {
+		key = b.config.KeyFunc(item.Input)
+	} else {
+		key = "" // Use empty string for non-sharded mode
+	}
+
+	// Add item to batch manager - it handles timer management internally
+	b.batchManager.AddItem(key, item)
 }
 
 // dispatchBatchProcessing acquires a worker slot from the workerPool and starts a new
