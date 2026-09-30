@@ -752,7 +752,7 @@ func TestBatchManager_UnifiedApproach(t *testing.T) {
 	// Test non-sharded mode (cleanup disabled)
 	t.Run("NonShardedMode", func(t *testing.T) {
 		triggerChannel := make(chan string, 10)
-		bm := NewBatchManager[string, string](false, nil, triggerChannel, 100*time.Millisecond, 2) // cleanup disabled
+		bm := NewBatchManager[string, string](false, nil, triggerChannel, 100*time.Millisecond, 2, nil) // cleanup disabled - fixed
 		defer bm.Stop()
 
 		// Create a sample item
@@ -814,7 +814,8 @@ func TestBatchManager_UnifiedApproach(t *testing.T) {
 			CleanupInterval:      100 * time.Millisecond,
 		}
 		triggerChannel := make(chan string, 10)
-		bm := NewBatchManager[string, string](true, config, triggerChannel, 500*time.Millisecond, 2) // cleanup enabled, long timer
+		cleanupChannel := make(chan struct{}, 1)
+		bm := NewBatchManager[string, string](true, config, triggerChannel, 500*time.Millisecond, 2, cleanupChannel) // cleanup enabled, long timer - fixed
 		defer bm.Stop()
 
 		// Create items with different keys
@@ -1252,7 +1253,7 @@ func TestBatcher_TimerDoesNotTriggerEmptyBatch(t *testing.T) {
 	t.Parallel()
 
 	triggerChannel := make(chan string, 10)
-	bm := NewBatchManager[string, string](false, nil, triggerChannel, 100*time.Millisecond, 2)
+	bm := NewBatchManager[string, string](false, nil, triggerChannel, 100*time.Millisecond, 2, nil) // fixed
 	defer bm.Stop()
 
 	// Create and add an item
