@@ -80,6 +80,8 @@ type Batcher[T any, Q any] struct {
 	// batchManager handles batches for both sharded and non-sharded modes.
 	// Cleanup logic is only enabled when sharding is used (KeyFunc != nil).
 	batchManager *BatchManager[T, Q]
+	// cleanupChannel is used to receive signals for periodic cleanup.
+	cleanupChannel chan struct{}
 }
 
 // NewBatcher creates and initializes a new Batcher instance.
@@ -112,10 +114,12 @@ func NewBatcher[T any, Q any](config BatchProcessorConfig[T, Q], batchInterval t
 		stopChan:      make(chan struct{}),             // Signal channel for stopping.
 	}
 
-	// Always initialize batch manager, with cleanup enabled only if KeyFunc is provided
-	cleanupEnabled := config.KeyFunc != nil
+	// Always initialize batch manager and cleanup channel
 	triggerChannel := make(chan string, 100) // Buffered channel for batch ready notifications
-	b.batchManager = NewBatchManager[T, Q](cleanupEnabled, config.CleanupConfig, triggerChannel, batchInterval, maxBatchSize)
+	cleanupChannel := make(chan struct{}, 1) // Buffer of 1 to prevent blocking
+	b.cleanupChannel = cleanupChannel
+
+	b.batchManager = NewBatchManager[T, Q](config.KeyFunc != nil, config.CleanupConfig, triggerChannel, batchInterval, maxBatchSize, cleanupChannel)
 
 	go b.runCollector(triggerChannel) // Start the main batch collection loop.
 	return b
@@ -145,7 +149,15 @@ func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 		default:
 		}
 
-		// PRIORITY 3: Only process items if no triggers are pending
+		// PRIORITY 3: Process cleanup signals
+		select {
+		case <-b.cleanupChannel:
+			b.batchManager.performCleanup()
+			continue // Prioritize other signals after cleanup
+		default:
+		}
+
+		// PRIORITY 4: Only process items if no triggers are pending
 		select {
 		case item, ok := <-b.itemChannel:
 			if !ok {
@@ -167,6 +179,8 @@ func (b *Batcher[T, Q]) runCollector(triggerChannel chan string) {
 					continue
 				}
 				b.handleItem(item)
+			case <-b.cleanupChannel:
+				b.batchManager.performCleanup()
 			}
 		}
 	}
